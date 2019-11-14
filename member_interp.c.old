@@ -1,0 +1,316 @@
+# define _BSD_SOURCE
+# define _XOPEN_SOURCE 
+# include <stdio.h>
+# include <stdlib.h>
+# include <time.h>
+# include <math.h>
+# include <string.h>
+# include <unistd.h>
+# include <limits.h>
+# include <sys/types.h>
+# include <stdint.h>
+# include <ctype.h>
+# include <hdf5.h>
+# include <hdf5_hl.h>
+
+void date_from_sec(char *date,time_t secs);
+time_t sec_from_date(char *date);
+int H5get_variable_string(hid_t h5,char *datasetname, char *attrname, char *str);
+
+int main(int argc, char *argv[])
+{
+
+   /* HDF5 variables */
+  hid_t INH5;
+  hid_t datatype;
+  hsize_t dims[3];
+  H5T_class_t class_id;
+  size_t typesize;
+  uint8_t *PGMAccdata,*obsdata;
+  uint16_t newNodata,obsZNtoncZN[256]={0},ZN1,ZN0;
+  uint16_t *ZNarr0,*ZNarr1,*pZNarr0,*pZNarr1,*tmpZNarr; 
+  int32_t **accDZ,*Accdata,PGMAcc;
+  int i,timesteps=0,tI,intsteps=1,nodata,DZarrlen;
+  char hdr[300],outpath[300],*timestamp,nowcstamp[15],datasetname[200];
+  char *membername,*h5file,*obsfile,*outdir,varstr[1000];
+  long xsize,ysize,csize,arrsize,fieldsize;
+  long tX,tY,sX,sY,N,sN,tN;
+  double *motarr,fu,fv;
+  double ZR_A,ZR_B,gain,offset,fnodata;
+  time_t obsecs,ncsecs,dT;
+  FILE *INPGM, *OUTPGM;
+
+  setbuf(stdout,NULL);
+  H5Eset_auto(H5E_DEFAULT,NULL,NULL);
+
+  timestamp=argv[1];
+  membername=argv[2];
+  h5file=argv[3];
+  obsfile=argv[4];
+  outdir=argv[5];
+  if(argv[6]) timesteps=atoi(argv[6]);
+  if(argv[7]) intsteps=atoi(argv[7]);
+
+  obsecs=sec_from_date(timestamp);
+
+  /* Open nowcast file and read configuration attributes */
+  INH5=H5Fopen(h5file, H5F_ACC_RDONLY, H5P_DEFAULT);
+  if(H5get_variable_string(INH5,"/meta/configuration","ZR_A",varstr) >= 0 )
+     ZR_A=atof(varstr); else ZR_A=223.0;
+  if(H5get_variable_string(INH5,"/meta/configuration","ZR_B",varstr) >= 0 )
+     ZR_B=atof(varstr); else ZR_B=1.53;
+  if(H5get_variable_string(INH5,"/meta/configuration","NOWCAST_TIMESTEP",varstr) >= 0 )
+     dT=60*atoi(varstr); else dT=300;
+  if(H5get_variable_string(INH5,"/meta/configuration","NUM_TIMESTEPS",varstr) >= 0 )
+    if(!timesteps) timesteps=atoi(varstr); /* 6h with 5min steps */
+
+  /* Read data conversion attributes */  
+  sprintf(datasetname,"/member-00/leadtime-00");
+  H5LTget_attribute_double(INH5,datasetname,"gain",&gain);
+  H5LTget_attribute_double(INH5,datasetname,"nodata",&fnodata);
+  H5LTget_attribute_double(INH5,datasetname,"offset",&offset);
+  nodata=(uint16_t)(fnodata+1e-6);
+
+  printf("%f %f %f %f %d\n",ZR_A, ZR_B, gain, offset, nodata);
+
+  /* Read the motion field */
+  sprintf(datasetname,"%s/motion",membername);
+  H5LTget_dataset_info(INH5,datasetname, dims, &class_id, &typesize );
+  csize=(long)dims[0];
+  ysize=(long)dims[1];
+  xsize=(long)dims[2];
+  fieldsize=xsize*ysize;
+  arrsize=fieldsize*csize;
+  motarr=malloc(arrsize*typesize);
+  datatype=H5T_IEEE_F64LE; /* for motion data */
+  H5LTread_dataset(INH5,datasetname,datatype,motarr);
+
+  /* Create LUT for accumulation per one nowcast timestep for each dBZN value pair */
+  {
+     double B,C,R,Rscaler,dBZ;
+     int zN,zN0,zN1,maxdBZ=100,maxN; /* maxN = 1320, jos gain=0.1 ja offset=-32 */
+     int32_t *zNAcc;
+     uint32_t IR; /* [1/10000 mm] */
+
+     maxN = (maxdBZ-offset)/gain;
+     newNodata = DZarrlen = maxN+1;
+
+     zNAcc = calloc(DZarrlen,sizeof(int32_t));
+     accDZ = malloc(DZarrlen*sizeof(int32_t *));
+     accDZ[0] = calloc(DZarrlen,sizeof(int32_t));     
+
+     Rscaler = 10000.0*dT/3600.0; /* Conversion from intensity [mm/h] to accumulation during one timestep [1/10000 mm] */
+     B = 0.1/ZR_B;
+     C = log10(ZR_A)/ZR_B;
+
+     /* zN -> AccdT vektori */
+     for(zN=1;zN<=maxN;zN++)
+     {
+        accDZ[zN] = calloc(DZarrlen,sizeof(int32_t));
+        dBZ = gain*(double)zN-offset;
+        R = pow(10.0,B*dBZ - C);
+        IR = (uint32_t)(R*Rscaler);
+        zNAcc[zN]=IR;
+     }
+  
+     for(zN=0;zN<=maxN;zN++) accDZ[maxN][zN] = accDZ[zN][maxN] = -1; /* Either value outside area or "nodata" */
+     accDZ[0][0] = 0;
+
+     /* Average of two timestep-accumulation (because R is linear) */
+     for(zN0=1; zN0<maxN; zN0++) for(zN1=zN0; zN1<maxN; zN1++)
+     {
+        if(zN0 == zN1) accDZ[zN1][zN0] = zNAcc[zN0];
+        else accDZ[zN0][zN1] = accDZ[zN1][zN0] = (zNAcc[zN0] + zNAcc[zN1])/2;
+     }
+    
+     free(zNAcc);
+  }
+
+  /* Create obsdata to ncdata LUT */
+  {
+     uint16_t N;
+ 
+     obsZNtoncZN[255] = newNodata;
+     for(N=1;N<255;N++) obsZNtoncZN[N] = (uint16_t)((0.5*(double)N-32-offset)/gain);
+  }
+
+  /* Read last observation dBZ data */
+  INPGM=fopen(obsfile,"r");
+  for(i=0;i<3;i++)
+  {
+    memset(hdr,0,300);
+    fgets(hdr,299,INPGM);
+    if(hdr[0]=='#') { i--; continue; }
+    /*    if(i==1) sscanf(hdr,"%ld %ld",&Xdim,&Ydim); */
+  }
+  obsdata = malloc(fieldsize);
+  PGMAccdata = malloc(fieldsize);
+  Accdata = calloc(fieldsize,sizeof(int32_t));
+  fread(obsdata,1,fieldsize,INPGM);
+  fclose(INPGM);
+
+  /* Create data arrays and pointers */
+  ZNarr0=malloc(fieldsize*sizeof(uint16_t));
+  ZNarr1=malloc(fieldsize*sizeof(uint16_t));
+  pZNarr0 = ZNarr0;
+  pZNarr1 = ZNarr1;
+
+  /* Convert obsdata to nc-type data */
+  for(N=0;N<fieldsize;N++) ZNarr0[N] = obsZNtoncZN[obsdata[N]];
+
+  datatype=H5T_STD_U16LE; /* For nc data */
+
+
+/* Main time loop ________________________________________________________________________________________________ */
+
+  for(tI=0;tI<timesteps;tI++)
+  {
+     ncsecs=dT*(tI+1);
+     date_from_sec(nowcstamp,obsecs+ncsecs);
+
+     /* Read nc data for timestep tI */
+     sprintf(datasetname,"/%s/leadtime-%02d",membername,tI);
+     H5LTread_dataset(INH5,datasetname,datatype,pZNarr1);
+     for(N=0;N<fieldsize;N++) if(pZNarr1[N] == nodata) pZNarr1[N]=newNodata;
+
+     /* reset monitor accumulation field */
+     memset(PGMAccdata,0,fieldsize);
+
+     /* Loop thru area */
+     for(sY=0;sY<ysize;sY++) for(sX=0;sX<xsize;sX++)
+     {
+        sN=sY*xsize+sX;
+        ZN1=pZNarr1[sN];
+        if(ZN1 == newNodata) { Accdata[sN] = INT_MIN; continue; }
+        
+        fu=motarr[sN];
+        fv=motarr[sN+fieldsize];
+
+        tX=(long)(sX-fu);
+        tY=(long)(sY-fv);
+
+        if(tX>=xsize ||
+           tX<0      ||
+           tY>=ysize ||
+	   tY<0       ) { Accdata[sN] = INT_MIN; continue; }
+
+        tN=tY*xsize+tX;
+
+        ZN0=pZNarr0[tN];
+        if(ZN0 == newNodata) { Accdata[sN] = INT_MIN; continue; }
+        if(! (ZN0|ZN1)) continue;
+
+	Accdata[sN] += accDZ[ZN0][ZN1];
+     }
+
+     /* swap array pointers */
+     tmpZNarr = pZNarr0;
+     pZNarr0 = pZNarr1;
+     pZNarr1 = tmpZNarr;
+     
+     /* create PGM data for monitoring */
+     for(N=0;N<fieldsize;N++)
+     { 
+       if(Accdata[N]<0) { PGMAccdata[N]=255; continue; }
+       if(! Accdata[N]) continue;
+       if(Accdata[N]<2000) { PGMAccdata[N]=1; continue; }
+       PGMAcc = Accdata[N]/1000;
+       if(PGMAcc>250) PGMAccdata[N]=250; else PGMAccdata[N]=PGMAcc;
+     }
+
+     sprintf(outpath,"%s/Interacc_%s_%s-%s.pgm",outdir,membername,timestamp,nowcstamp);
+     OUTPGM=fopen(outpath,"w");
+     fprintf(OUTPGM,"P5\n%ld %ld\n255\n",xsize,ysize);
+     fwrite(PGMAccdata,1,fieldsize,OUTPGM);
+     fclose(OUTPGM);
+
+     /* Write RAVAKE-style accumulation data for one member only */
+     sprintf(outpath,"%s/RAVACC_%s-%.12s+%03d.dat",outdir,timestamp,nowcstamp,(int)(ncsecs/60));
+     OUTPGM=fopen(outpath,"w");
+     fwrite(Accdata,1,fieldsize*sizeof(int32_t),OUTPGM);
+     fclose(OUTPGM);
+
+     printf("%s\n",nowcstamp);
+  }
+
+/* ________________________________________________________________________________________________ */
+
+
+  for(i=0;i<DZarrlen;i++) free(accDZ[i]);
+  free(accDZ);
+  free(PGMAccdata);
+  free(Accdata);
+  free(ZNarr0);
+  free(ZNarr1);
+  free(obsdata);
+  free(motarr);
+
+  return(0);
+}
+
+/* ################################################################################################ */
+
+void date_from_sec(char *date,time_t secs)
+{
+   struct tm *Sdd;
+
+   Sdd=gmtime(&secs);
+   sprintf(date,"%d%02d%02d%02d%02d%02d",Sdd->tm_year+1900,Sdd->tm_mon+1,
+                                         Sdd->tm_mday,Sdd->tm_hour,
+	                                 Sdd->tm_min,Sdd->tm_sec);
+   return;
+}
+
+/* ================================================================================================ */
+
+time_t sec_from_date(char *date)
+{
+   struct tm Sd,*Sdd;
+   int y,m;
+   time_t secs;
+ 
+   sscanf(date,"%4d%2d%2d%2d%2d",&y,&m,&Sd.tm_mday,&Sd.tm_hour,&Sd.tm_min);
+   Sd.tm_year=y-1900;
+   Sd.tm_mon=m-1;
+   Sd.tm_isdst=0;
+   Sd.tm_sec=0;
+   Sdd=&Sd;
+   secs=mktime(Sdd);
+   return(secs);
+}
+
+/* ================================================================================================ */
+
+int H5get_variable_string(hid_t h5,char *datasetname, char *attrname, char *str)
+{
+   hid_t dataset,attr,memtype,space;
+   hvl_t  rdata;             /* Pointer to vlen structures */
+   char *ptr;
+   int i,len;
+   /*
+   int ndims,i,len;
+   hsize_t dims[1] = {1};
+   */
+   herr_t status;
+
+   memset(str,0,strlen(str));
+   dataset=H5Dopen(h5,datasetname,H5P_DEFAULT);
+   if(dataset<0) dataset=H5Gopen(h5,datasetname,H5P_DEFAULT);
+   if(dataset<0) return(-1);
+   attr = H5Aopen(dataset, attrname, H5P_DEFAULT);
+
+   space = H5Aget_space(attr);
+   memtype = H5Tvlen_create(H5T_NATIVE_CHAR);
+   status = H5Aread(attr, memtype, &rdata);
+   if(status<0) return(-1);
+   ptr = rdata.p;
+   len = rdata.len;
+   for (i=0; i<len; i++) str[i]=ptr[i];
+
+   status = H5Dvlen_reclaim (memtype, space, H5P_DEFAULT, &rdata);
+   status = H5Aclose (attr);
+   status = H5Dclose (dataset);
+   status = H5Sclose (space);
+   status = H5Tclose (memtype);
+   return(len);
+}
